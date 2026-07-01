@@ -79,22 +79,67 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth (client_secret_basic)
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      try {
+        const tenant = await xeroTenant(env, h);
+        if (!tenant) return { connected: false };
+        return {
+          connected: true,
+          org: tenant.tenantName,
+          sandbox: /demo company/i.test(tenant.tenantName || ''),
+          lastSync: await lastSync(env, 'accounting')
+        };
+      } catch (err) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      const tenant = await xeroTenant(env, h);
+      if (!tenant) throw new NotConfigured('accounting');
+      const data = await h.fetchJson(
+        XERO_API + '/Reports/ProfitAndLoss?fromDate=' + q.from + '&toDate=' + q.to,
+        { headers: { 'Xero-Tenant-Id': tenant.tenantId, 'Accept': 'application/json' } }
+      );
+      const parsed = parsePL(data, 1);
+      return {
+        revenue: parsed.revenue[0],
+        cogs: parsed.cogs[0],
+        wagesSuper: parsed.wagesSuper[0],
+        overheads: parsed.overheads[0]
+      };
+    },
+    async fetchMonthly(env, h, q) {
+      const tenant = await xeroTenant(env, h);
+      if (!tenant) throw new NotConfigured('accounting');
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (let i = 0; i < months.length; i += 12) {
+        const batch = months.slice(i, i + 12);
+        const fromDate = batch[0] + '-01';
+        const toDate = monthEndDate(batch[batch.length - 1]);
+        const periods = batch.length - 1;
+        const url = XERO_API + '/Reports/ProfitAndLoss?fromDate=' + fromDate + '&toDate=' + toDate +
+          '&timeframe=MONTH&periods=' + periods;
+        const data = await h.fetchJson(url, { headers: { 'Xero-Tenant-Id': tenant.tenantId, 'Accept': 'application/json' } });
+        const parsed = parsePL(data, batch.length);
+        out.months.push(...batch);
+        out.revenue.push(...parsed.revenue);
+        out.cogs.push(...parsed.cogs);
+        out.wagesSuper.push(...parsed.wagesSuper);
+        out.overheads.push(...parsed.overheads);
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -144,6 +189,98 @@ const ADAPTERS = {
 
 class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
+}
+
+/* ---------------- Xero (accounting) adapter helpers ---------------------- */
+
+const XERO_API = 'https://api.xero.com/api.xro/2.0';
+const WAGE_RE = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+
+/* Resolve (and cache in the token record) which Xero organisation this
+   connection is for. The Starter tier is one connection = one org, so the
+   first entry from /connections is it. */
+async function xeroTenant(env, h) {
+  const tokens = await h.getTokens();
+  if (!tokens) return null;
+  if (tokens.tenantId && tokens.tenantName) return { tenantId: tokens.tenantId, tenantName: tokens.tenantName };
+  const conns = await h.fetchJson('https://api.xero.com/connections', {});
+  if (!Array.isArray(conns) || conns.length === 0) return null;
+  const tenant = conns[0];
+  await h.saveTokens({ ...tokens, tenantId: tenant.tenantId, tenantName: tenant.tenantName });
+  return { tenantId: tenant.tenantId, tenantName: tenant.tenantName };
+}
+
+function monthEndDate(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(Date.UTC(y, m, 0)); /* day 0 of next month = last day of this month */
+  return ym + '-' + String(last.getUTCDate()).padStart(2, '0');
+}
+
+function findSection(rows, matchFn) {
+  for (const row of rows || []) {
+    if (row.RowType === 'Section' && matchFn(row.Title || '')) return row;
+  }
+  return null;
+}
+
+function cellsToNumbers(cells, nCols) {
+  const out = [];
+  for (let i = 1; i <= nCols; i++) {
+    const raw = cells[i] ? String(cells[i].Value).replace(/,/g, '') : '0';
+    const v = parseFloat(raw);
+    out.push(isFinite(v) ? v : 0);
+  }
+  return out;
+}
+
+function sectionTotals(section, nCols) {
+  const rows = (section && section.Rows) || [];
+  const summary = rows.find((r) => r.RowType === 'SummaryRow');
+  if (summary) return cellsToNumbers(summary.Cells, nCols);
+  const totals = new Array(nCols).fill(0);
+  rows.filter((r) => r.RowType === 'Row').forEach((r) => {
+    cellsToNumbers(r.Cells, nCols).forEach((n, i) => { totals[i] += n; });
+  });
+  return totals;
+}
+
+/* Wage/super lines within Operating Expenses: keyword-matched here, then
+   CONFIRMED WITH THE OWNER at reconciliation (capability-matrix.md, kpi-spec.md
+   rule 5) - this proposes, the owner's confirmation is what makes it correct. */
+function wageSuperTotals(opexSection, nCols) {
+  const rows = ((opexSection && opexSection.Rows) || []).filter((r) => r.RowType === 'Row');
+  const totals = new Array(nCols).fill(0);
+  const matched = [];
+  rows.forEach((r) => {
+    const label = (r.Cells[0] && r.Cells[0].Value) || '';
+    if (WAGE_RE.test(label)) {
+      matched.push(label);
+      cellsToNumbers(r.Cells, nCols).forEach((n, i) => { totals[i] += n; });
+    }
+  });
+  return { totals, matched };
+}
+
+/* Parse a Xero ProfitAndLoss report into per-column (period) arrays.
+   nCols = number of amount columns requested (1 for a single range,
+   batch.length for a multi-period pull). See capability-matrix.md (Xero)
+   for the report shape and the worked example this mirrors. */
+function parsePL(data, nCols) {
+  const report = data && data.Reports && data.Reports[0];
+  const rows = (report && report.Rows) || [];
+  const incomeSection =
+    findSection(rows, (t) => /^(trading\s+)?income$|^revenue$/i.test(t)) ||
+    findSection(rows, (t) => /income/i.test(t) && !/other/i.test(t));
+  const cosSection = findSection(rows, (t) => /cost of sales/i.test(t));
+  const opexSection = findSection(rows, (t) => /operating expenses/i.test(t));
+
+  const revenue = incomeSection ? sectionTotals(incomeSection, nCols) : new Array(nCols).fill(null);
+  const cogs = cosSection ? sectionTotals(cosSection, nCols) : new Array(nCols).fill(0);
+  const opexTotal = opexSection ? sectionTotals(opexSection, nCols) : new Array(nCols).fill(0);
+  const wageResult = opexSection ? wageSuperTotals(opexSection, nCols) : { totals: new Array(nCols).fill(0), matched: [] };
+  const overheads = opexTotal.map((t, i) => t - (wageResult.totals[i] || 0));
+
+  return { revenue, cogs, wagesSuper: wageResult.totals, overheads, matchedWageLabels: wageResult.matched };
 }
 
 const PLAIN_ERRORS = {
