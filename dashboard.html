@@ -268,7 +268,8 @@ var KIT_CONFIG = {
   "providers": {
     "accounting": "Xero",
     "pos": "Square",
-    "rostering": "Urhere"
+    "rostering": "Urhere",
+    "website": "Wix"
   },
   "metrics": [
     "revenue",
@@ -386,6 +387,7 @@ var SOURCES = [
   { key: 'accounting', name: P.accounting, role: 'Money figures (' + KIT_CONFIG.taxLabel + ')' },
   { key: 'pos',        name: P.pos,        role: 'Transaction count' }
 ];
+if (P.website) SOURCES.push({ key: 'website', name: P.website, role: 'Additional transaction count (online orders)' });
 if (P.rostering) SOURCES.push({ key: 'rostering', name: P.rostering, role: 'Projected wages (optional)' });
 
 /* ============================================================
