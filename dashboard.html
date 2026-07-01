@@ -280,7 +280,9 @@ var KIT_CONFIG = {
     "overheads",
     "profit",
     "overheadsOwner",
-    "profitOwner"
+    "profitOwner",
+    "allTransactions",
+    "acsAll"
   ],
   "kitDate": "July 2026",
   "feedbackUrl": ""
@@ -379,7 +381,18 @@ var METRIC_DEFS = {
                   decision: 'Same as Overheads, but with the wage you draw as owner set aside — your fixed running costs only.' },
   profitOwner:  { label: 'Profit (excl. your wage)', fmt: 'money', dual: true, needs: ['accounting'], goodDir: 'up',
                   def: 'Additional metric, not one of the standard seven: Profit with your own wage and super draw added back, since you don’t work day-to-day in the venue · from ' + P.accounting,
-                  decision: 'What the venue makes once your own wage is treated as a draw rather than a cost — closer to its true trading result.' }
+                  decision: 'What the venue makes once your own wage is treated as a draw rather than a cost — closer to its true trading result.' },
+  /* ADDITIONAL METRICS (owner-requested, July 2026) - not part of the kit's
+     locked seven. The locked Number of transactions / Average customer spend
+     stay Square-only exactly as defined; these add every other connected
+     sales channel (currently the website) on top, for a fuller picture. */
+  allTransactions: { label: 'All transactions (all channels)', fmt: 'int', needs: ['pos'], goodDir: 'up',
+                  def: 'Additional metric, not one of the standard seven: completed transactions across every connected channel — your till (' + P.pos + ')'
+                    + (P.website ? ' plus website orders (' + P.website + ')' : '') + ', refunds and voids excluded',
+                  decision: 'Total genuine sales activity across every way customers pay you, not just the till.' },
+  acsAll:       { label: 'Average customer spend (all channels)', fmt: 'money2', needs: ['accounting', 'pos'], goodDir: 'up',
+                  def: 'Additional metric, not one of the standard seven: Revenue (' + P.accounting + ', ' + KIT_CONFIG.taxLabel + ') ÷ all-channel transactions (till plus connected online channels)',
+                  decision: 'Spend per sale across every channel combined — a fuller picture than the till alone once online orders are a meaningful share.' }
 };
 var CHOSEN = KIT_CONFIG.metrics.filter(function (k) { return METRIC_DEFS[k]; });
 
@@ -600,6 +613,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
   var acc = p.accounting || null;
   var pos = p.pos || null;
   var ros = p.rostering || null;
+  var web = p.website || null;
   var out = {};
   if (acc) {
     out.revenue = num(acc.revenue);
@@ -610,7 +624,21 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
   }
   if (pos) out.count = num(pos.count);
   if (ros) out.rosteredCost = num(ros.cost);
+  if (web) out.websiteCount = num(web.count);
   return out;
+}
+/* Extra transaction-count channels beyond the till, for the additional
+   "All transactions (all channels)" / "Average customer spend (all channels)"
+   metrics (owner-requested, kpi-spec.md deviation - kept separate from the
+   locked Square-only Number of transactions / Average customer spend).
+   Add a key here (matching the field periodValues() sets above) as each new
+   channel connects - Podium will add 'podiumCount' when it's wired. */
+var EXTRA_TXN_KEYS = ['websiteCount'];
+function allTransactionsCount(vals) {
+  if (vals.count == null) return null;
+  var total = vals.count;
+  EXTRA_TXN_KEYS.forEach(function (k) { if (typeof vals[k] === 'number') total += vals[k]; });
+  return total;
 }
 function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
 
@@ -678,6 +706,13 @@ function metricValue(key, vals) {
     if (vals.revenue == null || vals.count == null) return null;
     if (vals.count === 0) return 'dash';
     return vals.revenue / vals.count;
+  }
+  if (key === 'allTransactions') return allTransactionsCount(vals);
+  if (key === 'acsAll') {
+    var allTxn = allTransactionsCount(vals);
+    if (vals.revenue == null || allTxn == null) return null;
+    if (allTxn === 0) return 'dash';
+    return vals.revenue / allTxn;
   }
   return null;
 }
@@ -1014,12 +1049,24 @@ function trendSeries(key) {
   var months = d.trend.months;
   var acc = d.trend.accounting || {};
   var pos = d.trend.pos || {};
+  var web = d.trend.website || {};
   function at(arr, i) { return (arr && arr[i] != null) ? arr[i] : null; }
+  /* All-channel transaction count for one trend point: till plus every extra
+     channel with monthly history (currently the website; Podium joins the
+     same total once connected - see EXTRA_TXN_KEYS). */
+  function allTxnAt(i) {
+    var c = at(pos.count, i);
+    if (c == null) return null;
+    var extra = at(web.count, i);
+    return c + (typeof extra === 'number' ? extra : 0);
+  }
   function val(i) {
     var rev = at(acc.revenue, i);
     if (key === 'revenue') return rev;
     if (key === 'transactions') return at(pos.count, i);
     if (key === 'acs') { var c = at(pos.count, i); return (rev == null || c == null || c === 0) ? null : rev / c; }
+    if (key === 'allTransactions') return allTxnAt(i);
+    if (key === 'acsAll') { var t = allTxnAt(i); return (rev == null || t == null || t === 0) ? null : rev / t; }
     if (rev == null || rev === 0) return null;
     var cg = at(acc.cogs, i), wg = at(acc.wagesSuper, i), oh = at(acc.overheads, i), ow = at(acc.ownerWage, i);
     if (key === 'cogs') return (cg == null) ? null : (cg / rev) * 100;
@@ -1241,7 +1288,9 @@ function renderConnections(root) {
     }
 
     var act = el('div', 'conn-actions');
-    if (st.configured) {
+    if (st.auth === 'apikey') {
+      act.appendChild(el('span', 'conn-line', st.connected ? 'Set up with a site key your AI put in place. Nothing to click here.' : 'Your AI is setting this up with a site key — nothing for you to click here.'));
+    } else if (st.configured) {
       var rec = el('button', 'btn-plain', st.connected ? 'Reconnect' : 'Connect');
       rec.onclick = function () { window.location.href = '/auth/' + s.key + '/start'; };
       act.appendChild(rec);
@@ -1250,9 +1299,11 @@ function renderConnections(root) {
     }
     card.appendChild(act);
 
-    var cb = el('div', 'cb-url');
-    cb.innerHTML = 'Callback address for this connection (your AI may ask for it): <b>' + esc(location.origin + '/auth/' + s.key + '/callback') + '</b>';
-    card.appendChild(cb);
+    if (st.auth !== 'apikey') {
+      var cb = el('div', 'cb-url');
+      cb.innerHTML = 'Callback address for this connection (your AI may ask for it): <b>' + esc(location.origin + '/auth/' + s.key + '/callback') + '</b>';
+      card.appendChild(cb);
+    }
 
     if (st.ingest) card.appendChild(uploadPanel(s));
 
@@ -1360,6 +1411,10 @@ function renderRecon(root) {
       inst = 'This is an additional metric you asked for, not one of the standard seven. It’s worked out from Overheads (already verified) minus your own wage and super draw for these dates. If Overheads is confirmed, this is right by definition.';
     } else if (k === 'profitOwner') {
       inst = 'This is an additional metric you asked for, not one of the standard seven. It’s worked out from Profit (already verified) plus your own wage and super draw for these dates. If Profit is confirmed, this is right by definition.';
+    } else if (k === 'allTransactions') {
+      inst = 'This is an additional metric you asked for, not one of the standard seven. Open ' + P.pos + ' reporting for exactly these dates (already verified) and add your ' + (P.website || 'website') + ' order count for the same dates. Does the total match the figure above? Watch for double-counting - a website order that was also re-rung through the till should only count once.';
+    } else if (k === 'acsAll') {
+      inst = 'This is an additional metric you asked for, not one of the standard seven. It’s worked out from revenue (from ' + P.accounting + ', already verified) divided by All transactions (all channels), just above. If both are confirmed, this is right by definition.';
     } else {
       inst = 'Open ' + P.accounting + ' and run your profit and loss for exactly these dates. Does ' + def.label + ' there match the figure above, to the cent?';
     }
