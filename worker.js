@@ -115,14 +115,15 @@ const ADAPTERS = {
         revenue: parsed.revenue[0],
         cogs: parsed.cogs[0],
         wagesSuper: parsed.wagesSuper[0],
-        overheads: parsed.overheads[0]
+        overheads: parsed.overheads[0],
+        ownerWage: parsed.ownerWage[0]
       };
     },
     async fetchMonthly(env, h, q) {
       const tenant = await xeroTenant(env, h);
       if (!tenant) throw new NotConfigured('accounting');
       const months = monthList(q.fromMonth, q.toMonth);
-      const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [], ownerWage: [] };
       for (let i = 0; i < months.length; i += 12) {
         const batch = months.slice(i, i + 12);
         const fromDate = batch[0] + '-01';
@@ -137,6 +138,7 @@ const ADAPTERS = {
         out.cogs.push(...parsed.cogs);
         out.wagesSuper.push(...parsed.wagesSuper);
         out.overheads.push(...parsed.overheads);
+        out.ownerWage.push(...parsed.ownerWage);
       }
       return out;
     }
@@ -392,6 +394,26 @@ function wageSuperTotals(opexSection, nCols) {
   return { totals, matched };
 }
 
+/* ADDITIONAL METRIC (owner-requested, kpi-spec.md deviation - kept separate from
+   the locked Overheads/Profit): the owner draws a wage + super from these two
+   "(overhead)"-labelled accounts but doesn't work day-to-day in the venue, so
+   they asked for a Profit/Overheads view that excludes that draw. This totals
+   exactly the accounts wageSuperTotals() above excludes - never touches the
+   locked Wage %, Overheads, or Profit figures themselves. */
+function ownerWageTotals(opexSection, nCols) {
+  const rows = collectRows(opexSection);
+  const totals = new Array(nCols).fill(0);
+  const matched = [];
+  rows.forEach((r) => {
+    const label = (r.Cells[0] && r.Cells[0].Value) || '';
+    if (WAGE_RE.test(label) && OVERHEAD_LABOUR_RE.test(label)) {
+      matched.push(label);
+      cellsToNumbers(r.Cells, nCols).forEach((n, i) => { totals[i] += n; });
+    }
+  });
+  return { totals, matched };
+}
+
 /* Parse a Xero ProfitAndLoss report into per-column (period) arrays.
    nCols = number of amount columns requested (1 for a single range,
    batch.length for a multi-period pull). See capability-matrix.md (Xero)
@@ -410,8 +432,9 @@ function parsePL(data, nCols) {
   const opexTotal = opexSection ? sectionTotals(opexSection, nCols) : new Array(nCols).fill(0);
   const wageResult = opexSection ? wageSuperTotals(opexSection, nCols) : { totals: new Array(nCols).fill(0), matched: [] };
   const overheads = opexTotal.map((t, i) => t - (wageResult.totals[i] || 0));
+  const ownerWageResult = opexSection ? ownerWageTotals(opexSection, nCols) : { totals: new Array(nCols).fill(0), matched: [] };
 
-  return { revenue, cogs, wagesSuper: wageResult.totals, overheads, matchedWageLabels: wageResult.matched };
+  return { revenue, cogs, wagesSuper: wageResult.totals, overheads, ownerWage: ownerWageResult.totals, matchedWageLabels: wageResult.matched, matchedOwnerWageLabels: ownerWageResult.matched };
 }
 
 const PLAIN_ERRORS = {
