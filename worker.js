@@ -233,12 +233,27 @@ function cellsToNumbers(cells, nCols) {
   return out;
 }
 
+/* Recursively collect every RowType:'Row' line under a section, including ones
+   nested inside sub-sections (some Xero P&L layouts group accounts under
+   sub-headings, e.g. an "overhead" grouping within Operating Expenses) - a flat
+   top-level scan silently drops those and undercounts. */
+function collectRows(section) {
+  const out = [];
+  (function walk(rows) {
+    for (const r of rows || []) {
+      if (r.RowType === 'Row') out.push(r);
+      else if (r.RowType === 'Section') walk(r.Rows);
+    }
+  })((section && section.Rows) || []);
+  return out;
+}
+
 function sectionTotals(section, nCols) {
   const rows = (section && section.Rows) || [];
   const summary = rows.find((r) => r.RowType === 'SummaryRow');
   if (summary) return cellsToNumbers(summary.Cells, nCols);
   const totals = new Array(nCols).fill(0);
-  rows.filter((r) => r.RowType === 'Row').forEach((r) => {
+  collectRows(section).forEach((r) => {
     cellsToNumbers(r.Cells, nCols).forEach((n, i) => { totals[i] += n; });
   });
   return totals;
@@ -248,7 +263,7 @@ function sectionTotals(section, nCols) {
    CONFIRMED WITH THE OWNER at reconciliation (capability-matrix.md, kpi-spec.md
    rule 5) - this proposes, the owner's confirmation is what makes it correct. */
 function wageSuperTotals(opexSection, nCols) {
-  const rows = ((opexSection && opexSection.Rows) || []).filter((r) => r.RowType === 'Row');
+  const rows = collectRows(opexSection);
   const totals = new Array(nCols).fill(0);
   const matched = [];
   rows.forEach((r) => {
@@ -598,7 +613,7 @@ async function authCallback(env, source, url) {
   const gotState = url.searchParams.get('state');
   const wantState = await env.TOKENS.get('oauthstate:' + source);
   if (!code || !gotState || gotState !== wantState) {
-    return new Response('That authorisation didn’t complete cleanly. Go back to the dashboard and click Reconnect to try again.', { status: 400 });
+    return new Response('That authorisation didn\u2019t complete cleanly. Go back to the dashboard and click Reconnect to try again.', { status: 400 });
   }
   await env.TOKENS.delete('oauthstate:' + source);
   const redirectUri = url.origin + '/auth/' + source + '/callback';
@@ -608,7 +623,7 @@ async function authCallback(env, source, url) {
     redirect_uri: redirectUri
   }, env));
   if (!res.ok) {
-    return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
+    return new Response('The connection couldn\u2019t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn\u2019t match exactly.', { status: 502 });
   }
   const t = await res.json();
   await saveTokens(env, source, {
