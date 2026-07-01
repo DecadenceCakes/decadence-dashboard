@@ -255,33 +255,50 @@ async function squareLocations(env) {
   return data.locations || [];
 }
 
+/* Fetch every COMPLETED payment id for one location matching a given set of
+   List Payments query params (paginated via cursor). Used twice below - once
+   filtered by the payment's created_at (begin_time/end_time), once by its
+   offline client_created_at (offline_begin_time/offline_end_time) - because
+   the two filters are mutually exclusive on Square's side, and a payment
+   taken while the till was briefly offline can otherwise fall outside the
+   created_at window and be silently missed. */
+async function squarePaymentIds(env, locationId, extraParams) {
+  const ids = [];
+  let cursor = null;
+  do {
+    const params = new URLSearchParams({ limit: '100', location_id: locationId, ...extraParams });
+    if (cursor) params.set('cursor', cursor);
+    const res = await fetch(SQUARE_API + '/v2/payments?' + params.toString(), {
+      headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
+    });
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    const data = await res.json();
+    for (const p of (data.payments || [])) {
+      if (p.status === 'COMPLETED') ids.push(p.id);
+    }
+    cursor = data.cursor || null;
+  } while (cursor);
+  return ids;
+}
+
 /* Count COMPLETED payments (voids/cancellations excluded; refunds are
    separate records and never reduce this count) for [from, to] inclusive,
    across every location, honouring the venue's timezone and trading-day
-   rollover hour. Paginates via cursor. Never returns a dollar figure - see
+   rollover hour, and including offline-taken payments synced later.
+   De-duplicated by payment id. Never returns a dollar figure - see
    kpi-spec.md rule 2. */
 async function squareCompletedCount(env, from, to, tz, rollover) {
   const beginTime = zonedTimeToUtc(from, rollover || 0, tz || 'Australia/Sydney').toISOString();
   const endTime = zonedTimeToUtc(addDaysStr(to, 1), rollover || 0, tz || 'Australia/Sydney').toISOString();
   const locations = await squareLocations(env);
-  let count = 0;
+  const seen = new Set();
   for (const loc of locations) {
-    let cursor = null;
-    do {
-      const params = new URLSearchParams({ begin_time: beginTime, end_time: endTime, limit: '100', location_id: loc.id });
-      if (cursor) params.set('cursor', cursor);
-      const res = await fetch(SQUARE_API + '/v2/payments?' + params.toString(), {
-        headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
-      });
-      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
-      const data = await res.json();
-      for (const p of (data.payments || [])) {
-        if (p.status === 'COMPLETED') count++;
-      }
-      cursor = data.cursor || null;
-    } while (cursor);
+    const online = await squarePaymentIds(env, loc.id, { begin_time: beginTime, end_time: endTime });
+    online.forEach((id) => seen.add(id));
+    const offline = await squarePaymentIds(env, loc.id, { offline_begin_time: beginTime, offline_end_time: endTime });
+    offline.forEach((id) => seen.add(id));
   }
-  return count;
+  return seen.size;
 }
 
 /* ---------------- Xero (accounting) adapter helpers ---------------------- */
