@@ -156,12 +156,39 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      try {
+        const res = await fetch(SQUARE_API + '/v2/locations', {
+          headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
+        });
+        if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+        const data = await res.json();
+        const loc = (data.locations || [])[0];
+        if (!loc) return { connected: false };
+        return {
+          connected: true,
+          org: loc.name + (loc.business_name && loc.business_name !== loc.name ? ' · ' + loc.business_name : ''),
+          sandbox: false,
+          lastSync: await lastSync(env, 'pos')
+        };
+      } catch (err) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      return { count: await squareCompletedCount(env, q.from, q.to, q.tz, q.rollover) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const counts = [];
+      for (const mo of months) {
+        counts.push(await squareCompletedCount(env, mo + '-01', monthEndDate(mo), q.tz, q.rollover));
+      }
+      return { months, count: counts };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -189,6 +216,58 @@ const ADAPTERS = {
 
 class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
+}
+
+/* ---------------- Square (pos) adapter helpers ---------------------------- */
+
+const SQUARE_API = 'https://connect.squareup.com';
+const SQUARE_VERSION = '2026-05-20';
+
+/* Convert a local wall-clock instant (date + hour, in a given IANA timezone)
+   to the correct UTC Date - handles DST via the double-format trick. */
+function zonedTimeToUtc(dateStr, hour, tz) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const utcGuess = Date.UTC(y, m - 1, d, hour, 0, 0);
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const parts = dtf.formatToParts(new Date(utcGuess)).reduce((a, p) => { if (p.type !== 'literal') a[p.type] = p.value; return a; }, {});
+  const asIfUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour === 24 ? 0 : +parts.hour, +parts.minute, +parts.second);
+  const offset = asIfUTC - utcGuess;
+  return new Date(utcGuess - offset);
+}
+function addDaysStr(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+/* Count COMPLETED payments (voids/cancellations excluded; refunds are
+   separate records and never reduce this count) for [from, to] inclusive,
+   honouring the venue's timezone and trading-day rollover hour. Paginates
+   via cursor. Never returns a dollar figure - see kpi-spec.md rule 2. */
+async function squareCompletedCount(env, from, to, tz, rollover) {
+  const beginTime = zonedTimeToUtc(from, rollover || 0, tz || 'Australia/Sydney').toISOString();
+  const endTime = zonedTimeToUtc(addDaysStr(to, 1), rollover || 0, tz || 'Australia/Sydney').toISOString();
+  let count = 0;
+  let cursor = null;
+  do {
+    const params = new URLSearchParams({ begin_time: beginTime, end_time: endTime, limit: '100' });
+    if (cursor) params.set('cursor', cursor);
+    const res = await fetch(SQUARE_API + '/v2/payments?' + params.toString(), {
+      headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
+    });
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    const data = await res.json();
+    for (const p of (data.payments || [])) {
+      if (p.status === 'COMPLETED') count++;
+    }
+    cursor = data.cursor || null;
+  } while (cursor);
+  return count;
 }
 
 /* ---------------- Xero (accounting) adapter helpers ---------------------- */
