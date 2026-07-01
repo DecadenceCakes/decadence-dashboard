@@ -161,16 +161,13 @@ const ADAPTERS = {
     oauth: {},
     async status(env, h) {
       try {
-        const res = await fetch(SQUARE_API + '/v2/locations', {
-          headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
-        });
-        if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
-        const data = await res.json();
-        const loc = (data.locations || [])[0];
-        if (!loc) return { connected: false };
+        const locations = await squareLocations(env);
+        if (!locations.length) return { connected: false };
+        const businessName = locations[0].business_name;
+        const names = locations.map((l) => l.name).join(' + ');
         return {
           connected: true,
-          org: loc.name + (loc.business_name && loc.business_name !== loc.name ? ' · ' + loc.business_name : ''),
+          org: (businessName && businessName !== names ? businessName + ' · ' : '') + names + (locations.length > 1 ? ' (' + locations.length + ' locations, all counted)' : ''),
           sandbox: false,
           lastSync: await lastSync(env, 'pos')
         };
@@ -245,28 +242,45 @@ function addDaysStr(dateStr, n) {
   return dt.toISOString().slice(0, 10);
 }
 
+/* OWNER CONFIRMED (reconciliation, July 2026): this Square account has two
+   tills, both for Decadence Cakes - count completed transactions across ALL
+   locations, not just the default one (the List Payments endpoint otherwise
+   scopes to the seller's single default location and silently undercounts). */
+async function squareLocations(env) {
+  const res = await fetch(SQUARE_API + '/v2/locations', {
+    headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
+  });
+  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+  const data = await res.json();
+  return data.locations || [];
+}
+
 /* Count COMPLETED payments (voids/cancellations excluded; refunds are
    separate records and never reduce this count) for [from, to] inclusive,
-   honouring the venue's timezone and trading-day rollover hour. Paginates
-   via cursor. Never returns a dollar figure - see kpi-spec.md rule 2. */
+   across every location, honouring the venue's timezone and trading-day
+   rollover hour. Paginates via cursor. Never returns a dollar figure - see
+   kpi-spec.md rule 2. */
 async function squareCompletedCount(env, from, to, tz, rollover) {
   const beginTime = zonedTimeToUtc(from, rollover || 0, tz || 'Australia/Sydney').toISOString();
   const endTime = zonedTimeToUtc(addDaysStr(to, 1), rollover || 0, tz || 'Australia/Sydney').toISOString();
+  const locations = await squareLocations(env);
   let count = 0;
-  let cursor = null;
-  do {
-    const params = new URLSearchParams({ begin_time: beginTime, end_time: endTime, limit: '100' });
-    if (cursor) params.set('cursor', cursor);
-    const res = await fetch(SQUARE_API + '/v2/payments?' + params.toString(), {
-      headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
-    });
-    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
-    const data = await res.json();
-    for (const p of (data.payments || [])) {
-      if (p.status === 'COMPLETED') count++;
-    }
-    cursor = data.cursor || null;
-  } while (cursor);
+  for (const loc of locations) {
+    let cursor = null;
+    do {
+      const params = new URLSearchParams({ begin_time: beginTime, end_time: endTime, limit: '100', location_id: loc.id });
+      if (cursor) params.set('cursor', cursor);
+      const res = await fetch(SQUARE_API + '/v2/payments?' + params.toString(), {
+        headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Accept': 'application/json' }
+      });
+      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      const data = await res.json();
+      for (const p of (data.payments || [])) {
+        if (p.status === 'COMPLETED') count++;
+      }
+      cursor = data.cursor || null;
+    } while (cursor);
+  }
   return count;
 }
 
