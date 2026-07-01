@@ -196,19 +196,22 @@ const ADAPTERS = {
      pos, to feed the additional "All transactions" / "Average customer spend
      (all channels)" metrics - the locked Square-only Number of transactions
      and Average customer spend are untouched.
-     Auth is Wix's app-instance model, not the generic oauth{} flow above:
-     one-time install captures instanceId, then every call mints a short-lived
-     (4hr) access token from client_id + client_secret + instanceId - no
-     refresh token to rotate. Secrets: WIX_APP_ID, WIX_APP_SECRET. */
+     Auth is a Wix account-level API Key (Settings > API Keys Manager on
+     manage.wix.com), scoped to this one site with eCommerce/Orders read
+     permission - NOT the OAuth app-install flow (that's for apps distributed
+     to other people's sites; this is the owner's own single site, and Wix's
+     own docs point single-site server-to-server integrations at API Keys
+     instead). No browser redirect, no token refresh, nothing for the owner
+     to click here - it just works once the two secrets are set.
+     Secrets: WIX_API_KEY, WIX_SITE_ID. */
   website: {
     configured: true,
-    auth: 'wix',
+    auth: 'apikey',
     oauth: {},
     async status(env, h) {
+      if (!env.WIX_API_KEY || !env.WIX_SITE_ID) return { connected: false };
       try {
-        const tokens = await h.getTokens();
-        if (!tokens || !tokens.instanceId) return { connected: false };
-        await wixAccessToken(env, tokens.instanceId);
+        await wixSearchOrderCount(env, new Date(Date.now() - 86400000).toISOString(), new Date().toISOString());
         return {
           connected: true,
           org: 'Your Wix site (orders)',
@@ -216,21 +219,19 @@ const ADAPTERS = {
           lastSync: await lastSync(env, 'website')
         };
       } catch (err) {
-        return { connected: false };
+        return { connected: false, error: { plain: 'Your Wix connection needs attention. Tell your AI it’s showing an error.' } };
       }
     },
     async fetchRange(env, h, q) {
-      const tokens = await h.getTokens();
-      if (!tokens || !tokens.instanceId) throw new NotConfigured('website');
-      return { count: await wixCompletedCount(env, tokens.instanceId, q.from, q.to, q.tz, q.rollover) };
+      if (!env.WIX_API_KEY || !env.WIX_SITE_ID) throw new NotConfigured('website');
+      return { count: await wixCompletedCount(env, q.from, q.to, q.tz, q.rollover) };
     },
     async fetchMonthly(env, h, q) {
-      const tokens = await h.getTokens();
-      if (!tokens || !tokens.instanceId) throw new NotConfigured('website');
+      if (!env.WIX_API_KEY || !env.WIX_SITE_ID) throw new NotConfigured('website');
       const months = monthList(q.fromMonth, q.toMonth);
       const counts = [];
       for (const mo of months) {
-        counts.push(await wixCompletedCount(env, tokens.instanceId, mo + '-01', monthEndDate(mo), q.tz, q.rollover));
+        counts.push(await wixCompletedCount(env, mo + '-01', monthEndDate(mo), q.tz, q.rollover));
       }
       return { months, count: counts };
     }
@@ -358,33 +359,14 @@ async function squareCompletedCount(env, from, to, tz, rollover) {
 
 const WIX_API = 'https://www.wixapis.com';
 
-/* Mint a short-lived (4hr) access token from the app's client credentials and
-   the site's permanent instanceId (captured once at install time). Wix's OAuth
-   apps use this instead of a rotating refresh token - see Create Access Token
-   in Wix's API reference. */
-async function wixAccessToken(env, instanceId) {
-  const res = await fetch(WIX_API + '/oauth2/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      client_id: env.WIX_APP_ID || '',
-      client_secret: env.WIX_APP_SECRET || '',
-      instance_id: instanceId
-    })
-  });
-  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
-  const data = await res.json();
-  return data.access_token;
-}
-
 /* Count orders that represent a genuine completed sale: not canceled, and paid
    (a later refund never removes it from the count - kpi-spec.md rule 2, same
    principle as the Square adapter). Paginated defensively: only follows a
    cursor when a full page (100) came back, so an unexpected response shape
-   degrades to "first page only" rather than looping forever. */
-async function wixSearchOrderCount(env, instanceId, beginIso, endIso) {
-  const token = await wixAccessToken(env, instanceId);
+   degrades to "first page only" rather than looping forever.
+   Auth: a site-scoped Wix API Key, sent as a raw Authorization header (no
+   Bearer prefix) plus a wix-site-id header - no token minting, no refresh. */
+async function wixSearchOrderCount(env, beginIso, endIso) {
   let count = 0;
   let cursor = null;
   do {
@@ -399,7 +381,11 @@ async function wixSearchOrderCount(env, instanceId, beginIso, endIso) {
     if (cursor) body.cursorPaging.cursor = cursor;
     const res = await fetch(WIX_API + '/ecom/v1/orders/search', {
       method: 'POST',
-      headers: { 'Authorization': token, 'Content-Type': 'application/json' },
+      headers: {
+        'Authorization': env.WIX_API_KEY || '',
+        'wix-site-id': env.WIX_SITE_ID || '',
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(body)
     });
     if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
@@ -413,10 +399,10 @@ async function wixSearchOrderCount(env, instanceId, beginIso, endIso) {
   return count;
 }
 
-async function wixCompletedCount(env, instanceId, from, to, tz, rollover) {
+async function wixCompletedCount(env, from, to, tz, rollover) {
   const beginIso = zonedTimeToUtc(from, rollover || 0, tz || 'Australia/Sydney').toISOString();
   const endIso = zonedTimeToUtc(addDaysStr(to, 1), rollover || 0, tz || 'Australia/Sydney').toISOString();
-  return wixSearchOrderCount(env, instanceId, beginIso, endIso);
+  return wixSearchOrderCount(env, beginIso, endIso);
 }
 
 /* ---------------- Xero (accounting) adapter helpers ---------------------- */
@@ -844,11 +830,6 @@ function setupPage() {
 
 async function authStart(env, source, url) {
   const adapter = ADAPTERS[source];
-  if (adapter && adapter.auth === 'wix') {
-    const redirectUri = url.origin + '/auth/' + source + '/callback';
-    const p = new URLSearchParams({ appId: env.WIX_APP_ID || '', redirectUrl: redirectUri });
-    return Response.redirect('https://www.wix.com/installer/install?' + p.toString(), 302);
-  }
   if (!adapter || adapter.auth !== 'oauth' || !adapter.oauth.authorizeUrl) {
     return new Response('This connection is not set up for browser authorisation yet.', { status: 404 });
   }
@@ -868,20 +849,12 @@ async function authStart(env, source, url) {
 
 async function authCallback(env, source, url) {
   const adapter = ADAPTERS[source];
-  if (adapter && adapter.auth === 'wix') {
-    const instanceId = url.searchParams.get('instanceId');
-    if (!instanceId) {
-      return new Response('That installation didn\u2019t complete cleanly (no site was identified). Go back to the dashboard and click Reconnect to try again.', { status: 400 });
-    }
-    await saveTokens(env, source, { instanceId });
-    return Response.redirect(url.origin + '/', 302);
-  }
   const cfg = (adapter && adapter.oauth) || {};
   const code = url.searchParams.get('code');
   const gotState = url.searchParams.get('state');
   const wantState = await env.TOKENS.get('oauthstate:' + source);
   if (!code || !gotState || gotState !== wantState) {
-    return new Response('That authorisation didn\u2019t complete cleanly. Go back to the dashboard and click Reconnect to try again.', { status: 400 });
+    return new Response('That authorisation didn’t complete cleanly. Go back to the dashboard and click Reconnect to try again.', { status: 400 });
   }
   await env.TOKENS.delete('oauthstate:' + source);
   const redirectUri = url.origin + '/auth/' + source + '/callback';
@@ -891,7 +864,7 @@ async function authCallback(env, source, url) {
     redirect_uri: redirectUri
   }, env));
   if (!res.ok) {
-    return new Response('The connection couldn\u2019t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn\u2019t match exactly.', { status: 502 });
+    return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
   }
   const t = await res.json();
   await saveTokens(env, source, {
@@ -1017,16 +990,18 @@ async function sourceStatus(env, source) {
     const st = await adapter.status(env, h);
     return {
       configured: true,
+      auth: adapter.auth || null,
       ingest: typeof adapter.parseExport === 'function',
       connected: !!(st && st.connected),
       org: (st && st.org) || null,
       sandbox: !!(st && st.sandbox),
       lastSync: (st && st.lastSync) || (await lastSync(env, source)) || null,
-      error: null
+      error: (st && st.error) || null
     };
   } catch (err) {
     return {
       configured: true,
+      auth: adapter.auth || null,
       ingest: typeof adapter.parseExport === 'function',
       connected: false,
       org: null,
@@ -1174,7 +1149,7 @@ export default {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
     }
-    const authRoute = /^\/auth\/(accounting|pos|rostering|website)\/(start|callback)$/.exec(path);
+    const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
       return authRoute[2] === 'start' ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
