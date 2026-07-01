@@ -190,6 +190,52 @@ const ADAPTERS = {
     }
   },
 
+  /* >>> ADAPTER 2b: WEBSITE (Wix) - additional transaction-count channel, owner-
+     requested July 2026. Xero already carries this revenue (owner confirmed),
+     so this adapter supplies ONLY a completed-order count, same contract as
+     pos, to feed the additional "All transactions" / "Average customer spend
+     (all channels)" metrics - the locked Square-only Number of transactions
+     and Average customer spend are untouched.
+     Auth is Wix's app-instance model, not the generic oauth{} flow above:
+     one-time install captures instanceId, then every call mints a short-lived
+     (4hr) access token from client_id + client_secret + instanceId - no
+     refresh token to rotate. Secrets: WIX_APP_ID, WIX_APP_SECRET. */
+  website: {
+    configured: true,
+    auth: 'wix',
+    oauth: {},
+    async status(env, h) {
+      try {
+        const tokens = await h.getTokens();
+        if (!tokens || !tokens.instanceId) return { connected: false };
+        await wixAccessToken(env, tokens.instanceId);
+        return {
+          connected: true,
+          org: 'Your Wix site (orders)',
+          sandbox: false,
+          lastSync: await lastSync(env, 'website')
+        };
+      } catch (err) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.instanceId) throw new NotConfigured('website');
+      return { count: await wixCompletedCount(env, tokens.instanceId, q.from, q.to, q.tz, q.rollover) };
+    },
+    async fetchMonthly(env, h, q) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.instanceId) throw new NotConfigured('website');
+      const months = monthList(q.fromMonth, q.toMonth);
+      const counts = [];
+      for (const mo of months) {
+        counts.push(await wixCompletedCount(env, tokens.instanceId, mo + '-01', monthEndDate(mo), q.tz, q.rollover));
+      }
+      return { months, count: counts };
+    }
+  },
+
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
      Contract:
        status(env, h)        -> { connected, org, sandbox, lastSync }
@@ -208,6 +254,11 @@ const ADAPTERS = {
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
+
+/* Every adapter key, derived from ADAPTERS itself so a new source (website,
+   podium, ...) only needs adding there - the router/status/fetch loops below
+   all iterate this instead of a hand-maintained list. */
+const SOURCE_KEYS = Object.keys(ADAPTERS);
 
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
@@ -301,6 +352,71 @@ async function squareCompletedCount(env, from, to, tz, rollover) {
     offline.forEach((id) => seen.add(id));
   }
   return seen.size;
+}
+
+/* ---------------- Wix (website) adapter helpers --------------------------- */
+
+const WIX_API = 'https://www.wixapis.com';
+
+/* Mint a short-lived (4hr) access token from the app's client credentials and
+   the site's permanent instanceId (captured once at install time). Wix's OAuth
+   apps use this instead of a rotating refresh token - see Create Access Token
+   in Wix's API reference. */
+async function wixAccessToken(env, instanceId) {
+  const res = await fetch(WIX_API + '/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: env.WIX_APP_ID || '',
+      client_secret: env.WIX_APP_SECRET || '',
+      instance_id: instanceId
+    })
+  });
+  if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+  const data = await res.json();
+  return data.access_token;
+}
+
+/* Count orders that represent a genuine completed sale: not canceled, and paid
+   (a later refund never removes it from the count - kpi-spec.md rule 2, same
+   principle as the Square adapter). Paginated defensively: only follows a
+   cursor when a full page (100) came back, so an unexpected response shape
+   degrades to "first page only" rather than looping forever. */
+async function wixSearchOrderCount(env, instanceId, beginIso, endIso) {
+  const token = await wixAccessToken(env, instanceId);
+  let count = 0;
+  let cursor = null;
+  do {
+    const body = {
+      filter: {
+        createdDate: { '$gte': beginIso, '$lte': endIso },
+        status: { '$ne': 'CANCELED' },
+        paymentStatus: { '$in': ['PAID', 'PARTIALLY_REFUNDED', 'FULLY_REFUNDED'] }
+      },
+      cursorPaging: { limit: 100 }
+    };
+    if (cursor) body.cursorPaging.cursor = cursor;
+    const res = await fetch(WIX_API + '/ecom/v1/orders/search', {
+      method: 'POST',
+      headers: { 'Authorization': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    const data = await res.json();
+    const orders = data.orders || [];
+    count += orders.length;
+    const nextCursor = (data.pagingMetadata && data.pagingMetadata.cursors && data.pagingMetadata.cursors.next)
+      || (data.metadata && data.metadata.cursors && data.metadata.cursors.next) || null;
+    cursor = orders.length === 100 ? nextCursor : null;
+  } while (cursor);
+  return count;
+}
+
+async function wixCompletedCount(env, instanceId, from, to, tz, rollover) {
+  const beginIso = zonedTimeToUtc(from, rollover || 0, tz || 'Australia/Sydney').toISOString();
+  const endIso = zonedTimeToUtc(addDaysStr(to, 1), rollover || 0, tz || 'Australia/Sydney').toISOString();
+  return wixSearchOrderCount(env, instanceId, beginIso, endIso);
 }
 
 /* ---------------- Xero (accounting) adapter helpers ---------------------- */
@@ -728,6 +844,11 @@ function setupPage() {
 
 async function authStart(env, source, url) {
   const adapter = ADAPTERS[source];
+  if (adapter && adapter.auth === 'wix') {
+    const redirectUri = url.origin + '/auth/' + source + '/callback';
+    const p = new URLSearchParams({ appId: env.WIX_APP_ID || '', redirectUrl: redirectUri });
+    return Response.redirect('https://www.wix.com/installer/install?' + p.toString(), 302);
+  }
   if (!adapter || adapter.auth !== 'oauth' || !adapter.oauth.authorizeUrl) {
     return new Response('This connection is not set up for browser authorisation yet.', { status: 404 });
   }
@@ -747,6 +868,14 @@ async function authStart(env, source, url) {
 
 async function authCallback(env, source, url) {
   const adapter = ADAPTERS[source];
+  if (adapter && adapter.auth === 'wix') {
+    const instanceId = url.searchParams.get('instanceId');
+    if (!instanceId) {
+      return new Response('That installation didn\u2019t complete cleanly (no site was identified). Go back to the dashboard and click Reconnect to try again.', { status: 400 });
+    }
+    await saveTokens(env, source, { instanceId });
+    return Response.redirect(url.origin + '/', 302);
+  }
   const cfg = (adapter && adapter.oauth) || {};
   const code = url.searchParams.get('code');
   const gotState = url.searchParams.get('state');
@@ -843,7 +972,7 @@ async function monthlyIngested(env, source, fromMonth, toMonth) {
    The source's adapter.parseExport() turns it into day rows. */
 async function apiIngest(env, request, url) {
   const source = url.searchParams.get('source');
-  if (!['accounting', 'pos', 'rostering'].includes(source)) return json({ error: 'unknown source' }, 400);
+  if (!SOURCE_KEYS.includes(source)) return json({ error: 'unknown source' }, 400);
   const auth = request.headers.get('Authorization') || '';
   if (!env.INGEST_TOKEN || auth !== 'Bearer ' + env.INGEST_TOKEN) {
     return json({ error: 'not authorised', plain: 'That upload code didn\u2019t match. Check it with your AI and try again.' }, 401);
@@ -911,7 +1040,7 @@ async function sourceStatus(env, source) {
 async function fetchSlot(env, q) {
   /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  for (const source of SOURCE_KEYS) {
     const adapter = ADAPTERS[source];
     if (!adapter || !adapter.configured) { out[source] = null; continue; }
     try {
@@ -937,11 +1066,8 @@ async function apiMetrics(env, url) {
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
 
   const base = { tz, rollover };
-  const [sAcc, sPos, sRos] = await Promise.all([
-    sourceStatus(env, 'accounting'),
-    sourceStatus(env, 'pos'),
-    sourceStatus(env, 'rostering')
-  ]);
+  const statusPairs = await Promise.all(SOURCE_KEYS.map(async (k) => [k, await sourceStatus(env, k)]));
+  const statuses = Object.fromEntries(statusPairs);
 
   /* The provider calls (periods + trend) are the expensive part and the only
      thing that brushes provider rate limits on quick reopens/refreshes. Cache
@@ -968,7 +1094,8 @@ async function apiMetrics(env, url) {
     let trendOut = null;
     if (trend) {
       trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+      for (const source of SOURCE_KEYS) {
+        if (source === 'rostering') continue; /* projected wage % only, not part of the monthly trend grid */
         const adapter = ADAPTERS[source];
         if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
         try {
@@ -987,7 +1114,7 @@ async function apiMetrics(env, url) {
   return json({
     generatedAt: data.generatedAt,
     protected: true,
-    sources: { accounting: sAcc, pos: sPos, rostering: sRos },
+    sources: statuses,
     periods: data.periods,
     trend: data.trend
   });
@@ -1047,7 +1174,7 @@ export default {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
     }
-    const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
+    const authRoute = /^\/auth\/(accounting|pos|rostering|website)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
       return authRoute[2] === 'start' ? authStart(env, authRoute[1], url) : authCallback(env, authRoute[1], url);
@@ -1055,7 +1182,7 @@ export default {
     if (path === '/api/disconnect' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       const source = url.searchParams.get('source');
-      if (['accounting', 'pos', 'rostering'].includes(source)) {
+      if (SOURCE_KEYS.includes(source)) {
         await clearTokens(env, source);
         return json({ ok: true });
       }
@@ -1067,7 +1194,7 @@ export default {
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
-    for (const source of ['accounting', 'pos', 'rostering']) {
+    for (const source of SOURCE_KEYS) {
       const a = ADAPTERS[source];
       if (a && typeof a.scheduledPull === 'function') {
         try {
