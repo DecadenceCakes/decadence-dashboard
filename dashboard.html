@@ -277,7 +277,9 @@ var KIT_CONFIG = {
     "cogs",
     "wage",
     "overheads",
-    "profit"
+    "profit",
+    "overheadsOwner",
+    "profitOwner"
   ],
   "kitDate": "July 2026",
   "feedbackUrl": ""
@@ -365,7 +367,18 @@ var METRIC_DEFS = {
                   decision: 'Fixed costs drifting up? Review subscriptions, utilities and new recurring spend.' },
   profit:       { label: 'Profit', fmt: 'money', dual: true, needs: ['accounting'], goodDir: 'up',
                   def: 'Revenue less cost of sales, wages, super and overheads · from ' + P.accounting,
-                  decision: 'What the venue keeps after the costs you control. The bottom line of the board.' }
+                  decision: 'What the venue keeps after the costs you control. The bottom line of the board.' },
+  /* ADDITIONAL METRICS (owner-requested, July 2026) - not part of the kit's
+     locked seven. The owner draws a wage + super from the venue but doesn't
+     work day-to-day in it, so asked for a view with that draw set aside.
+     kpi-spec.md: build as an additional, clearly labelled metric and leave
+     the locked Overheads/Profit untouched - these two do exactly that. */
+  overheadsOwner: { label: 'Overheads (excl. your wage)', fmt: 'money', dual: true, needs: ['accounting'], goodDir: 'down',
+                  def: 'Additional metric, not one of the standard seven: Overheads with your own wage and super draw removed, since you don’t work day-to-day in the venue · from ' + P.accounting,
+                  decision: 'Same as Overheads, but with the wage you draw as owner set aside — your fixed running costs only.' },
+  profitOwner:  { label: 'Profit (excl. your wage)', fmt: 'money', dual: true, needs: ['accounting'], goodDir: 'up',
+                  def: 'Additional metric, not one of the standard seven: Profit with your own wage and super draw added back, since you don’t work day-to-day in the venue · from ' + P.accounting,
+                  decision: 'What the venue makes once your own wage is treated as a draw rather than a cost — closer to its true trading result.' }
 };
 var CHOSEN = KIT_CONFIG.metrics.filter(function (k) { return METRIC_DEFS[k]; });
 
@@ -591,6 +604,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
     out.cogs = num(acc.cogs);
     out.wagesSuper = num(acc.wagesSuper);
     out.overheads = num(acc.overheads);
+    out.ownerWage = num(acc.ownerWage);
   }
   if (pos) out.count = num(pos.count);
   if (ros) out.rosteredCost = num(ros.cost);
@@ -610,7 +624,21 @@ function shareDollars(key, vals) {
   if (key === 'overheads') return vals.overheads;
   if (key === 'wage') return vals.wagesSuper;
   if (key === 'profit') return profitDollars(vals);
+  if (key === 'overheadsOwner') return ownerExclOverheadsDollars(vals);
+  if (key === 'profitOwner') return ownerExclProfitDollars(vals);
   return null;
+}
+/* Additional-metric helpers (owner-requested deviation - see METRIC_DEFS above).
+   Both need the same four inputs as Profit plus the owner's own wage/super
+   draw; any missing piece returns null, same honesty rule as the locked ones. */
+function ownerExclOverheadsDollars(vals) {
+  if (vals.overheads == null || vals.ownerWage == null) return null;
+  return vals.overheads - vals.ownerWage;
+}
+function ownerExclProfitDollars(vals) {
+  var p = profitDollars(vals);
+  if (p == null || vals.ownerWage == null) return null;
+  return p + vals.ownerWage;
 }
 /* The % of revenue a dual metric represents (its primary headline figure). */
 function sharePct(key, vals) {
@@ -638,6 +666,8 @@ function metricValue(key, vals) {
   if (key === 'cogs') return vals.cogs;
   if (key === 'overheads') return vals.overheads;
   if (key === 'profit') return profitDollars(vals);
+  if (key === 'overheadsOwner') return ownerExclOverheadsDollars(vals);
+  if (key === 'profitOwner') return ownerExclProfitDollars(vals);
   if (key === 'wage') {
     if (vals.wagesSuper == null || vals.revenue == null || vals.revenue === 0) return null;
     return (vals.wagesSuper / vals.revenue) * 100;
@@ -890,9 +920,7 @@ function renderDashboard(root) {
 function periodLabel() {
   var p = PERIODS.filter(function (x) { return x.key === state.period; })[0];
   return p ? p.label.replace('…', '') : '';
-}
-
-function metricCard(key, cur, prev, yoy, r) {
+}function metricCard(key, cur, prev, yoy, r) {
   var def = METRIC_DEFS[key];
   var ready = def.needs.every(isConfigured);
   var card = el('div', 'mcard fade-in');
@@ -991,11 +1019,13 @@ function trendSeries(key) {
     if (key === 'transactions') return at(pos.count, i);
     if (key === 'acs') { var c = at(pos.count, i); return (rev == null || c == null || c === 0) ? null : rev / c; }
     if (rev == null || rev === 0) return null;
-    var cg = at(acc.cogs, i), wg = at(acc.wagesSuper, i), oh = at(acc.overheads, i);
+    var cg = at(acc.cogs, i), wg = at(acc.wagesSuper, i), oh = at(acc.overheads, i), ow = at(acc.ownerWage, i);
     if (key === 'cogs') return (cg == null) ? null : (cg / rev) * 100;
     if (key === 'overheads') return (oh == null) ? null : (oh / rev) * 100;
     if (key === 'wage') return (wg == null) ? null : (wg / rev) * 100;
     if (key === 'profit') return (cg == null || wg == null || oh == null) ? null : ((rev - cg - wg - oh) / rev) * 100;
+    if (key === 'overheadsOwner') return (oh == null || ow == null) ? null : ((oh - ow) / rev) * 100;
+    if (key === 'profitOwner') return (cg == null || wg == null || oh == null || ow == null) ? null : ((rev - cg - wg - oh + ow) / rev) * 100;
     return null;
   }
   var series = months.map(function (m, i) { return val(i); });
@@ -1324,6 +1354,10 @@ function renderRecon(root) {
       inst = 'This one is worked out from two numbers you’ve already checked: revenue (from ' + P.accounting + ') divided by transactions (from ' + P.pos + '). If both inputs match, this is right by definition.';
     } else if (k === 'wage') {
       inst = 'In your ' + P.accounting + ' profit and loss for these dates, add the wages and super lines, then divide by the revenue figure you verified. Does it come to the percentage above?';
+    } else if (k === 'overheadsOwner') {
+      inst = 'This is an additional metric you asked for, not one of the standard seven. It’s worked out from Overheads (already verified) minus your own wage and super draw for these dates. If Overheads is confirmed, this is right by definition.';
+    } else if (k === 'profitOwner') {
+      inst = 'This is an additional metric you asked for, not one of the standard seven. It’s worked out from Profit (already verified) plus your own wage and super draw for these dates. If Profit is confirmed, this is right by definition.';
     } else {
       inst = 'Open ' + P.accounting + ' and run your profit and loss for exactly these dates. Does ' + def.label + ' there match the figure above, to the cent?';
     }
